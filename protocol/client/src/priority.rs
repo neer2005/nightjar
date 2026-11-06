@@ -1,7 +1,8 @@
 //! Socket and thread priorities, as moonlight-common-c and Nightjar's `latency.c` set them.
 //!
-//! Three layers, all Linux and Android only (elsewhere they do nothing) except the control
-//! socket's marking, which Windows gets through qWAVE:
+//! Three layers, all Linux and Android only (elsewhere they do nothing) except the socket
+//! marking, which macOS gets as well (see below) and Windows gets for the control socket through
+//! qWAVE:
 //!
 //! - Socket QoS (`setSocketQos` in `PlatformSockets.c`) is always on: the audio and microphone
 //!   sockets get `SO_PRIORITY` 6 and the video socket 5, a local queue hint. They also get DSCP
@@ -16,6 +17,13 @@
 //!   control threads to nice -4.
 //! - The queued video decode thread is always raised to nice -8 (`THREAD_PRIORITY_URGENT_DISPLAY`),
 //!   or -4 when that is refused, as the PyroWave submission thread is.
+//!
+//! On macOS the DSCP marking is the same `IP_TOS` / `IPV6_TCLASS`, and the `SO_PRIORITY` values
+//! become a network service type (`SO_NET_SERVICE_TYPE`, the socket form of Network.framework's
+//! `serviceClass`): 6 is interactive voice, 5 interactive video, 0 best effort. macOS has no
+//! `SO_PRIORITY`; the service type is what sets the packet's place in the Mac's own output queues
+//! and, on Wi-Fi, its WMM access category (voice or video rather than best effort), which DSCP
+//! alone does not. The thread priorities stay Linux and Android only.
 //!
 //! The option is a plain argument, never process-global state, so two sessions in one
 //! process do not affect each other.
@@ -117,10 +125,21 @@ pub trait PriorityTarget {
     fn set_tos(&self, ipv6: bool, value: i32) -> io::Result<()>;
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 impl<S: std::os::fd::AsRawFd> PriorityTarget for S {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn set_priority(&self, value: i32) -> io::Result<()> {
         set_int_option(self.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PRIORITY, value)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn set_priority(&self, value: i32) -> io::Result<()> {
+        set_int_option(
+            self.as_raw_fd(),
+            libc::SOL_SOCKET,
+            mac::SO_NET_SERVICE_TYPE,
+            mac::service_type(value),
+        )
     }
 
     fn set_tos(&self, ipv6: bool, value: i32) -> io::Result<()> {
@@ -141,7 +160,27 @@ impl<S: std::os::fd::AsRawFd> PriorityTarget for S {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// `<sys/socket.h>`'s network service types, which the `libc` crate does not carry.
+#[cfg(target_os = "macos")]
+mod mac {
+    pub const SO_NET_SERVICE_TYPE: libc::c_int = 0x1116;
+    pub const NET_SERVICE_TYPE_BE: i32 = 0;
+    pub const NET_SERVICE_TYPE_VI: i32 = 3;
+    pub const NET_SERVICE_TYPE_VO: i32 = 4;
+
+    /// The service type for an `SO_PRIORITY` value: [`super::AUDIO_PRIORITY`] (audio, the
+    /// microphone, the control socket) is interactive voice, [`super::VIDEO_PRIORITY`]
+    /// interactive video, anything else (0 when a marking is taken off) best effort.
+    pub fn service_type(priority: i32) -> i32 {
+        match priority {
+            super::AUDIO_PRIORITY => NET_SERVICE_TYPE_VO,
+            super::VIDEO_PRIORITY => NET_SERVICE_TYPE_VI,
+            _ => NET_SERVICE_TYPE_BE,
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 fn set_int_option(
     fd: std::os::fd::RawFd,
     level: libc::c_int,
@@ -164,7 +203,7 @@ fn set_int_option(
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 impl<S> PriorityTarget for S {
     fn set_priority(&self, _value: i32) -> io::Result<()> {
         Ok(())
@@ -424,7 +463,7 @@ pub(crate) mod tests {
         assert_eq!(media_tos(Qos::BestEffort), None);
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     fn media_sockets_are_marked() {
         let audio = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -488,7 +527,7 @@ pub(crate) mod tests {
         assert!(open_control_flow(|m| panic!("{m}")).is_none());
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     pub(crate) fn read_option<S: std::os::fd::AsRawFd>(socket: &S, level: i32, name: i32) -> i32 {
         let mut value: i32 = -1;
         let mut length = std::mem::size_of::<i32>() as libc::socklen_t;
@@ -569,5 +608,61 @@ pub(crate) mod tests {
         let raised = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         prioritize_socket(&raised, Qos::BestEffort, true).unwrap();
         assert_eq!(read_priority(&raised), 6);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_service_type<S: std::os::fd::AsRawFd>(socket: &S) -> i32 {
+        read_option(socket, libc::SOL_SOCKET, mac::SO_NET_SERVICE_TYPE)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_priorities_become_service_types() {
+        assert_eq!(mac::service_type(AUDIO_PRIORITY), mac::NET_SERVICE_TYPE_VO);
+        assert_eq!(mac::service_type(VIDEO_PRIORITY), mac::NET_SERVICE_TYPE_VI);
+        assert_eq!(mac::service_type(0), mac::NET_SERVICE_TYPE_BE);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_media_sockets_get_voice_and_video_service() {
+        let audio = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert_eq!(read_service_type(&audio), mac::NET_SERVICE_TYPE_BE);
+        prioritize_socket(&audio, Qos::Audio, false).unwrap();
+        assert_eq!(read_service_type(&audio), mac::NET_SERVICE_TYPE_VO);
+        let video = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        prioritize_socket(&video, Qos::Video, false).unwrap();
+        assert_eq!(read_service_type(&video), mac::NET_SERVICE_TYPE_VI);
+        let plain = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        prioritize_socket(&plain, Qos::BestEffort, false).unwrap();
+        assert_eq!(read_service_type(&plain), mac::NET_SERVICE_TYPE_BE);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_mac_control_socket_is_marked_and_unmarked() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        mark_control_socket(&socket, false, true).unwrap();
+        assert_eq!(read_service_type(&socket), mac::NET_SERVICE_TYPE_VO);
+        assert_eq!(read_option(&socket, libc::IPPROTO_IP, libc::IP_TOS), CONTROL_TOS);
+        mark_control_socket(&socket, false, false).unwrap();
+        assert_eq!(read_service_type(&socket), mac::NET_SERVICE_TYPE_BE);
+        assert_eq!(read_option(&socket, libc::IPPROTO_IP, libc::IP_TOS), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_ipv6_mac_control_socket_gets_its_traffic_class() {
+        let Ok(socket) = std::net::UdpSocket::bind("[::1]:0") else {
+            return;
+        };
+        mark_control_socket(&socket, true, true).unwrap();
+        assert_eq!(
+            read_option(&socket, libc::IPPROTO_IPV6, libc::IPV6_TCLASS),
+            CONTROL_TOS
+        );
+        assert_eq!(read_service_type(&socket), mac::NET_SERVICE_TYPE_VO);
+        mark_control_socket(&socket, true, false).unwrap();
+        assert_eq!(read_option(&socket, libc::IPPROTO_IPV6, libc::IPV6_TCLASS), 0);
     }
 }
