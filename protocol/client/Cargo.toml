@@ -32,8 +32,9 @@ serde_json = "1"
 # Receive buffer sizes on the media sockets.
 socket2 = "0.5"
 
-# SO_PRIORITY on the media sockets and nice values on the stream threads.
-[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+# SO_PRIORITY on the media sockets and nice values on the stream threads; on macOS, IP_TOS and
+# SO_NET_SERVICE_TYPE.
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
